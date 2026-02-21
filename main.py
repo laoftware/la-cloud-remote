@@ -380,6 +380,7 @@ class PairingConsumeResponse(BaseModel):
 class CommandRequest(BaseModel):
     session_token: str = Field(..., min_length=1, max_length=128)
     command: str = Field(..., max_length=10)
+    pin_hash: Optional[str] = Field(None, min_length=64, max_length=64)
 
 class CommandResponse(BaseModel):
     status: str
@@ -557,7 +558,8 @@ async def command(request: Request, body: CommandRequest):
     """
     Queue a command for a device.
     Auth: session_token (obtained from /pairing/consume).
-    No device_id or PIN needed — the session_token maps to a device.
+    ARM requires only session_token.
+    DISARM requires session_token + pin_hash (server-side enforcement).
     """
     _FAIL = HTTPException(status_code=403, detail="Invalid credentials")
 
@@ -572,15 +574,28 @@ async def command(request: Request, body: CommandRequest):
         _delete_session(body.session_token)
         raise _FAIL
 
-    # Validate command
-    if body.command not in ("ARM", "DISARM"):
+    # Normalize command (accept any casing)
+    cmd = body.command.strip().upper()
+    if cmd not in ("ARM", "DISARM"):
         raise HTTPException(status_code=400, detail="Invalid command. Must be ARM or DISARM")
+
+    # DISARM requires PIN verification (server-side enforcement)
+    if cmd == "DISARM":
+        if not body.pin_hash:
+            raise _FAIL
+        # Check escalating lockout for this device
+        check_pin_lockout(device_id)
+        # Verify PIN
+        if not secrets.compare_digest(device["pin_hash"], body.pin_hash):
+            record_pin_failure(device_id)
+            raise _FAIL
+        record_pin_success(device_id)
 
     # Queue size limit
     if len(device["queue"]) >= MAX_QUEUE_SIZE:
         raise HTTPException(status_code=429, detail="Too many pending commands. Please wait.")
 
-    device["queue"].append(body.command)
+    device["queue"].append(cmd)
     return {"status": "ok"}
 
 
