@@ -219,7 +219,7 @@
 
         <!-- PIN entry screen (used for initial pairing AND disarm PIN) -->
         <div id="pin-screen">
-            <input type="tel" id="hidden-pin" class="hidden-input" maxlength="4" inputmode="numeric" autocomplete="off">
+            <input type="text" id="hidden-pin" class="hidden-input" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off">
 
             <div class="pin-dots" id="pin-dots" onclick="focusInput()">
                 <div class="pin-dot" id="dot0"><span class="pin-dot-inner" id="txt0"></span></div>
@@ -263,6 +263,7 @@
         let sessionToken = null;
         let pin = '';
         let busy = false;
+        let cachedPinHash = null; // set during pairing, used for instant disarm on re-scan
 
         // Current mode: 'pairing' (initial QR+PIN) or 'disarm' (PIN for disarm command)
         let pinMode = 'pairing';
@@ -295,6 +296,7 @@
         function clearSession() {
             localStorage.removeItem(SESSION_STORAGE_KEY);
             sessionToken = null;
+            cachedPinHash = null;
         }
 
         // --- Crypto ---
@@ -383,40 +385,20 @@
         // --- Hidden input handler ---
         const hiddenInput = document.getElementById('hidden-pin');
 
-        hiddenInput.addEventListener('input', function() {
-            this.value = this.value.replace(/\D/g, '').slice(0, 4);
-            pin = this.value;
-            updateDots();
-
-            if (pin.length === 4 && !busy) {
-                busy = true;
-                if (pinMode === 'pairing') {
-                    doPair();
-                } else {
-                    doDisarmWithPin();
-                }
-            }
-        });
-
-        document.addEventListener('keydown', function(e) {
+        hiddenInput.addEventListener('beforeinput', function(e) {
+            e.preventDefault();
             if (busy) return;
-            if (document.getElementById('pin-screen').style.display === 'none') return;
 
-            if (e.key >= '0' && e.key <= '9' && pin.length < 4) {
-                pin += e.key;
-                hiddenInput.value = pin;
+            if (e.inputType === 'insertText' && e.data && /^\d/.test(e.data) && pin.length < 4) {
+                pin += e.data.charAt(0);
                 updateDots();
                 if (pin.length === 4) {
                     busy = true;
-                    if (pinMode === 'pairing') {
-                        doPair();
-                    } else {
-                        doDisarmWithPin();
-                    }
+                    if (pinMode === 'pairing') doPair();
+                    else doDisarmWithPin();
                 }
-            } else if (e.key === 'Backspace' && pin.length > 0) {
+            } else if (e.inputType === 'deleteContentBackward' && pin.length > 0) {
                 pin = pin.slice(0, -1);
-                hiddenInput.value = pin;
                 updateDots();
             }
         });
@@ -447,6 +429,7 @@
                     const data = await resp.json();
                     sessionToken = data.session_token;
                     saveSession(sessionToken);
+                    cachedPinHash = pinHash; // cache for instant disarm on re-scan
 
                     // Remove token from URL so refresh doesn't re-consume
                     if (window.history.replaceState) {
@@ -454,10 +437,10 @@
                         window.history.replaceState({}, document.title, cleanUrl);
                     }
 
-                    // Show armed screen immediately, send ARM in background
+                    // Paired — show armed screen (ARM sent in background, harmless if already armed)
                     busy = false;
                     showArmedScreen();
-                    doArm();
+                    doArm(); // fire-and-forget, won't block UI
                 } else if (resp.status === 403) {
                     shakeDots();
                     showMessage('pin-message', 'Wrong PIN or expired QR', true);
@@ -524,10 +507,55 @@
             }
         }
 
-        // --- DISARM flow: show PIN screen, then send with pin_hash ---
+        // --- DISARM flow: use cached PIN if available, otherwise show PIN screen ---
         function startDisarm() {
             if (busy) return;
-            showPinScreen('disarm');
+            if (cachedPinHash) {
+                // Just paired — skip PIN re-entry and disarm instantly
+                busy = true;
+                doDisarmDirect(cachedPinHash);
+            } else {
+                showPinScreen('disarm');
+            }
+        }
+
+        async function doDisarmDirect(pinHash) {
+            document.getElementById('armed-status').textContent = 'Disarming...';
+            document.getElementById('btn-disarm').disabled = true;
+
+            try {
+                const resp = await fetch(BACKEND_URL + '/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        session_token: sessionToken,
+                        command: 'DISARM',
+                        pin_hash: pinHash,
+                    })
+                });
+
+                if (resp.ok) {
+                    clearSession();
+                    cachedPinHash = null;
+                    busy = false;
+                    document.getElementById('title').textContent = 'Disarmed';
+                    document.getElementById('subtitle').textContent = 'Session ended';
+                    showScreen('no-token');
+                    document.getElementById('no-token').querySelector('p').textContent = 'Disarmed successfully.';
+                    document.getElementById('no-token').querySelectorAll('p')[1].textContent = 'Scan a new QR code to use again.';
+                } else {
+                    // Cached hash failed (e.g. PIN was changed) — fall back to PIN screen
+                    cachedPinHash = null;
+                    busy = false;
+                    showPinScreen('disarm');
+                    showMessage('pin-message', 'Re-enter PIN to confirm', true);
+                }
+            } catch (error) {
+                cachedPinHash = null;
+                busy = false;
+                showArmedScreen();
+                showMessage('armed-message', 'Network error. Try again.', true);
+            }
         }
 
         async function doDisarmWithPin() {
